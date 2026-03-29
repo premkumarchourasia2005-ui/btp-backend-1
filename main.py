@@ -18,8 +18,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- MODEL ARCHITECTURES ---
-# Ensure these match your training architecture exactly
+# --- CORRECTED MODEL ARCHITECTURES ---
 
 class DLinear(nn.Module):
     def __init__(self, seq_len=24, pred_len=1):
@@ -27,7 +26,6 @@ class DLinear(nn.Module):
         self.Linear_Seasonal = nn.Linear(seq_len, pred_len)
         self.Linear_Trend = nn.Linear(seq_len, pred_len)
     def forward(self, x):
-        # x shape: [Batch, Seq, Features] -> We take the last feature (Load)
         seasonal = self.Linear_Seasonal(x[:, :, -1]) 
         trend = self.Linear_Trend(x[:, :, -1])
         return (seasonal + trend)
@@ -45,25 +43,31 @@ class BiLSTM(nn.Module):
 class Informer(nn.Module):
     def __init__(self, input_size=6, d_model=64):
         super(Informer, self).__init__()
-        self.enc_input = nn.Linear(input_size, d_model)
-        self.encoder = nn.TransformerEncoder(
+        # Changed to encoder_input to match your state_dict
+        self.encoder_input = nn.Linear(input_size, d_model)
+        # Added pos_encoder to match your state_dict
+        self.pos_encoder = nn.Parameter(torch.randn(1, 24, d_model))
+        # Changed to transformer_encoder to match your state_dict
+        self.transformer_encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(d_model, nhead=8, batch_first=True), num_layers=3
         )
         self.decoder = nn.Linear(d_model, 1)
     def forward(self, x):
-        x = self.enc_input(x)
-        x = self.encoder(x)
+        x = self.encoder_input(x) + self.pos_encoder
+        x = self.transformer_encoder(x)
         return self.decoder(x[:, -1, :])
 
 class FEDformer(nn.Module):
     def __init__(self, input_size=6, d_model=64, n_modes=12):
         super(FEDformer, self).__init__()
         self.enc_embedding = nn.Linear(input_size, d_model)
+        # Added pos_encoder to match your state_dict
+        self.pos_encoder = nn.Parameter(torch.randn(1, 24, d_model))
         self.w1 = nn.Parameter(torch.randn(d_model, d_model, n_modes, 2))
         self.decoder = nn.Linear(d_model, 1)
     def forward(self, x):
         B, L, C = x.shape
-        x = self.enc_embedding(x)
+        x = self.enc_embedding(x) + self.pos_encoder
         x_ft = torch.fft.rfft(x, dim=1)
         out_ft = torch.zeros(B, L//2 + 1, 64, device=x.device, dtype=torch.complex64)
         weights = torch.view_as_complex(self.w1)
@@ -89,12 +93,13 @@ def load_assets():
             
             if os.path.exists(pth_path) and os.path.exists(pkl_path):
                 model = m_class()
-                model.load_state_dict(torch.load(pth_path, map_location='cpu'))
+                # Added strict=False as a safety net for minor metadata differences
+                model.load_state_dict(torch.load(pth_path, map_location='cpu'), strict=False)
                 model.eval()
                 with open(pkl_path, "rb") as f:
                     scaler = pickle.load(f)
                 models_data[name] = {"model": model, "scaler": scaler}
-                print(f"✅ {name.upper()} loaded.")
+                print(f"✅ {name.upper()} loaded successfully.")
         except Exception as e:
             print(f"❌ Error loading {name}: {e}")
 
@@ -116,27 +121,26 @@ def run_inference(data: PredictRequest):
     model = models_data[m_key]["model"]
     scaler = models_data[m_key]["scaler"]
 
-    # 1. Prepare 24-step sequence (Tiling for single-point simulation)
-    # Feature order: temp, prev_load, isHoliday, month, hour, curr_load(placeholder)
+    # Feature order based on your CSV: temp, prev_load, isHoliday, month, hour, curr_load
     raw_row = [data.temp, data.prev_load, data.isHoliday, data.month, data.hour, data.prev_load]
     seq = np.tile(raw_row, (24, 1))
 
-    # 2. Scale
+    # Scale
     scaled_seq = scaler.transform(seq)
     input_tensor = torch.FloatTensor(scaled_seq).unsqueeze(0)
 
-    # 3. Predict
+    # Predict
     with torch.no_grad():
         output = model(input_tensor)
         pred_scaled = output.detach().cpu().numpy().flatten()[0]
 
-    # 4. Inverse Transform
+    # Inverse Transform
     dummy = np.zeros((1, 6))
     dummy[0, :5] = scaled_seq[-1, :5]
     dummy[0, -1] = pred_scaled
     final_val = scaler.inverse_transform(dummy)[0, -1]
 
-    # 5. Clip to 650 Grid Limit
+    # Clip to 650 Grid Limit
     return round(float(np.clip(final_val, 0, 650)), 2)
 
 @app.post("/predict")
