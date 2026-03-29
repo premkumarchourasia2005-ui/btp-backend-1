@@ -9,50 +9,52 @@ import os
 
 app = FastAPI()
 
-# --- CORS SETUP ---
+# ================= CORS =================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- MODEL ARCHITECTURES ---
+# ================= MODELS =================
 
 class DLinear(nn.Module):
     def __init__(self, seq_len=24, pred_len=1):
         super(DLinear, self).__init__()
         self.Linear_Seasonal = nn.Linear(seq_len, pred_len)
         self.Linear_Trend = nn.Linear(seq_len, pred_len)
+
     def forward(self, x):
-        # x shape: [Batch, Seq_Len, Features] -> We take the last feature (load)
-        seasonal = self.Linear_Seasonal(x[:, :, -1]) 
+        seasonal = self.Linear_Seasonal(x[:, :, -1])
         trend = self.Linear_Trend(x[:, :, -1])
         return (seasonal + trend)
+
 
 class BiLSTM(nn.Module):
     def __init__(self, input_size=6, hidden_size=64, num_layers=2):
         super(BiLSTM, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, bidirectional=True)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
+                            batch_first=True, bidirectional=True)
         self.fc = nn.Linear(hidden_size * 2, 1)
+
     def forward(self, x):
         _, (h_n, _) = self.lstm(x)
-        # Concatenate final forward and backward hidden states
         out = torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1)
         return self.fc(out)
 
+
 class Informer(nn.Module):
-    def __init__(self, input_size=6, d_model=64, d_ff=256): # d_ff set to 256 to match your weights
+    def __init__(self, input_size=6, d_model=64, d_ff=256):
         super(Informer, self).__init__()
         self.encoder_input = nn.Linear(input_size, d_model)
         self.pos_encoder = nn.Parameter(torch.randn(1, 24, d_model))
-        
-        # Corrected Transformer Layer with explicit d_ff
+
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=8, 
-            dim_feedforward=d_ff, # Fixed the 2048 vs 256 mismatch
+            d_model=d_model,
+            nhead=8,
+            dim_feedforward=d_ff,
             batch_first=True
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=3)
@@ -62,6 +64,7 @@ class Informer(nn.Module):
         x = self.encoder_input(x) + self.pos_encoder
         x = self.transformer_encoder(x)
         return self.decoder(x[:, -1, :])
+
 
 class FEDformer(nn.Module):
     def __init__(self, input_size=6, d_model=64, n_modes=12):
@@ -81,7 +84,8 @@ class FEDformer(nn.Module):
         x = torch.fft.irfft(out_ft, n=L, dim=1)
         return self.decoder(x[:, -1, :])
 
-# --- ASSET LOADING ---
+# ================= LOAD MODELS =================
+
 models_data = {}
 model_classes = {
     "dlinear": DLinear,
@@ -94,24 +98,26 @@ model_classes = {
 def load_assets():
     for name, m_class in model_classes.items():
         try:
-            pth_path = f"{name}_model.pth"
-            pkl_path = f"{name}_scaler.pkl"
-            
-            if os.path.exists(pth_path) and os.path.exists(pkl_path):
+            pth = f"{name}_model.pth"
+            pkl = f"{name}_scaler.pkl"
+
+            if os.path.exists(pth) and os.path.exists(pkl):
                 model = m_class()
-                # Load with strict=False to handle minor metadata differences
-                model.load_state_dict(torch.load(pth_path, map_location='cpu'), strict=False)
+                model.load_state_dict(torch.load(pth, map_location="cpu"), strict=False)
                 model.eval()
-                with open(pkl_path, "rb") as f:
+
+                with open(pkl, "rb") as f:
                     scaler = pickle.load(f)
+
                 models_data[name] = {"model": model, "scaler": scaler}
-                print(f"✅ {name.upper()} loaded successfully.")
+                print(f"✅ {name.upper()} loaded")
             else:
-                print(f"⚠️ Files missing for {name}: check .pth and .pkl naming.")
+                print(f"⚠️ Missing files for {name}")
         except Exception as e:
             print(f"❌ Error loading {name}: {e}")
 
-# --- SCHEMAS ---
+# ================= INPUT SCHEMA =================
+
 class PredictRequest(BaseModel):
     temp: float
     prev_load: float
@@ -120,55 +126,78 @@ class PredictRequest(BaseModel):
     hour: int
     model_name: str
 
-# --- CORE INFERENCE FUNCTION ---
+# ================= 🔥 KEY FIX: REALISTIC HISTORY =================
+
+def generate_history_sequence(data):
+    base = data.prev_load
+    hour = data.hour
+    seq = []
+
+    for i in range(24):
+        h = (hour - 23 + i) % 24
+
+        # realistic daily curve
+        if 0 <= h < 5:      factor = 0.55
+        elif 5 <= h < 9:    factor = 0.75
+        elif 9 <= h < 17:   factor = 0.90
+        elif 17 <= h < 22:  factor = 1.15
+        else:               factor = 0.80
+
+        hist_load = base * factor
+
+        seq.append([
+            data.temp,
+            hist_load,
+            data.isHoliday,
+            data.month,
+            h,
+            hist_load
+        ])
+
+    return np.array(seq)
+
+# ================= INFERENCE =================
+
 def run_inference(data: PredictRequest):
-    m_key = data.model_name.lower()
-    if m_key not in models_data:
+    key = data.model_name.lower()
+    if key not in models_data:
         return None
 
-    model = models_data[m_key]["model"]
-    scaler = models_data[m_key]["scaler"]
+    model = models_data[key]["model"]
+    scaler = models_data[key]["scaler"]
 
-    # Feature order: [temp, prev_load, isHoliday, month, hour, curr_load]
-    # We use prev_load as a placeholder for curr_load during the scaling step
-    raw_row = [data.temp, data.prev_load, data.isHoliday, data.month, data.hour, data.prev_load]
-    seq = np.tile(raw_row, (24, 1))
+    # 🔥 Generate proper 24h history
+    seq = generate_history_sequence(data)
 
-    # Scale the sequence
+    # scale
     scaled_seq = scaler.transform(seq)
     input_tensor = torch.FloatTensor(scaled_seq).unsqueeze(0)
 
-    # Predict
+    # predict
     with torch.no_grad():
-        output = model(input_tensor)
-        pred_scaled = output.detach().cpu().numpy().flatten()[0]
+        pred_scaled = model(input_tensor).cpu().numpy().flatten()[0]
 
-    # Inverse Transform Logic
-    # We must put the prediction in the 6th column (index 5) of a dummy array
-    dummy = np.zeros((1, 6))
-    dummy[0, :5] = scaled_seq[-1, :5] # Keep scaled inputs for context
-    dummy[0, 5] = pred_scaled         # Put prediction in target column
-    
-    final_val = scaler.inverse_transform(dummy)[0, 5]
+    # inverse scale (put prediction in target column)
+    dummy = np.zeros((1,6))
+    dummy[0,:5] = scaled_seq[-1,:5]
+    dummy[0,5] = pred_scaled
 
-    # Clip to 650 kW Grid Limit for IIT BHU
-    return round(float(np.clip(final_val, 0, 650)), 2)
+    final = scaler.inverse_transform(dummy)[0,5]
+    return round(float(np.clip(final, 0, 650)), 2)
+
+# ================= ROUTES =================
 
 @app.post("/predict")
 async def predict(data: PredictRequest):
     result = run_inference(data)
     if result is None:
-        raise HTTPException(status_code=400, detail=f"Model '{data.model_name}' not found or failed to load.")
+        raise HTTPException(status_code=400, detail="Model not loaded")
     return {"predicted_load_mw": result, "status": "success"}
 
 @app.get("/health")
-def health_check():
-    return {
-        "status": "online",
-        "loaded_models": list(models_data.keys()),
-        "expected_models": list(model_classes.keys())
-    }
+def health():
+    return {"loaded_models": list(models_data.keys())}
 
 @app.get("/")
 def home():
-    return {"message": "IIT BHU Power Forecasting API is Live", "docs": "/docs"}
+    return {"message": "Power Forecasting API Running"}
