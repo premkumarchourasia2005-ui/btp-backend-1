@@ -18,9 +18,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ================= MODELS =================
+# ================= 1. MODEL ARCHITECTURES =================
 
-# 1. Corrected DLinear Components
+# --- DLINEAR ---
 class MovingAvg(nn.Module):
     def __init__(self, kernel_size, stride):
         super(MovingAvg, self).__init__()
@@ -39,7 +39,6 @@ class DLinear(nn.Module):
         super(DLinear, self).__init__()
         self.seq_len = seq_len
         self.pred_len = pred_len
-        # Matches your Colab training exactly
         self.moving_avg = MovingAvg(kernel_size=25, stride=1) 
         self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
         self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
@@ -47,77 +46,88 @@ class DLinear(nn.Module):
     def forward(self, x):
         trend_init = self.moving_avg(x)
         seasonal_init = x - trend_init
-
-        # Matrix transpositions to match training dimensions
         seasonal_output = self.Linear_Seasonal(seasonal_init.transpose(1, 2))
         trend_output = self.Linear_Trend(trend_init.transpose(1, 2))
-
         return (seasonal_output + trend_output).transpose(1, 2)
 
-# 2. Other Models (Kept from your original code)
-class BiLSTM(nn.Module):
-    def __init__(self, input_size=6, hidden_size=64, num_layers=2):
-        super(BiLSTM, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, bidirectional=True)
-        self.fc = nn.Linear(hidden_size * 2, 1)
+
+# --- BI-LSTM ---
+class BiLSTMForecaster(nn.Module):
+    def __init__(self, input_size=6, hidden_size=64, num_layers=2, output_size=1):
+        super(BiLSTMForecaster, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
+                            batch_first=True, bidirectional=True, dropout=0.2)
+        self.fc = nn.Linear(hidden_size * 2, output_size)
+
     def forward(self, x):
         _, (h_n, _) = self.lstm(x)
         out = torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1)
         return self.fc(out)
 
-class Informer(nn.Module):
-    def __init__(self, input_size=6, d_model=64, d_ff=256):
-        super(Informer, self).__init__()
+
+# --- INFORMER ---
+class InformerForecaster(nn.Module):
+    def __init__(self, input_size=6, d_model=64, nhead=8, num_layers=3, dropout=0.1):
+        super(InformerForecaster, self).__init__()
+        self.model_type = 'Transformer'
+        self.pos_encoder = nn.Parameter(torch.zeros(1, 24, d_model)) 
         self.encoder_input = nn.Linear(input_size, d_model)
-        self.pos_encoder = nn.Parameter(torch.randn(1, 24, d_model))
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=8, dim_feedforward=d_ff, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=3)
+        encoder_layers = nn.TransformerEncoderLayer(d_model, nhead, d_model*4, dropout, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
         self.decoder = nn.Linear(d_model, 1)
+
     def forward(self, x):
         x = self.encoder_input(x) + self.pos_encoder
         x = self.transformer_encoder(x)
-        return self.decoder(x[:, -1, :])
+        x = self.decoder(x[:, -1, :]) 
+        return x
 
-class FEDformer(nn.Module):
+
+# --- FEDFORMER ---
+class FEDformerForecaster(nn.Module):
     def __init__(self, input_size=6, d_model=64, n_modes=12):
-        super(FEDformer, self).__init__()
+        super(FEDformerForecaster, self).__init__()
+        self.d_model = d_model
+        self.n_modes = n_modes
         self.enc_embedding = nn.Linear(input_size, d_model)
-        self.pos_encoder = nn.Parameter(torch.randn(1, 24, d_model))
         self.w1 = nn.Parameter(torch.randn(d_model, d_model, n_modes, 2))
+        self.pos_encoder = nn.Parameter(torch.zeros(1, 24, d_model))
         self.decoder = nn.Linear(d_model, 1)
+
     def forward(self, x):
         B, L, C = x.shape
         x = self.enc_embedding(x) + self.pos_encoder
-        x_ft = torch.fft.rfft(x, dim=1)
-        out_ft = torch.zeros(B, L//2 + 1, 64, device=x.device, dtype=torch.complex64)
-        weights = torch.view_as_complex(self.w1)
-        out_ft[:, :12, :] = torch.einsum('bjc,cdj->bjd', x_ft[:, :12, :], weights)
+        x_ft = torch.fft.rfft(x, dim=1) 
+        out_ft = torch.zeros(B, L//2 + 1, self.d_model, device=x.device, dtype=torch.complex64)
+        weights = torch.view_as_complex(self.w1) 
+        out_ft[:, :self.n_modes, :] = torch.einsum('bjc,cdj->bjd', x_ft[:, :self.n_modes, :], weights)
         x = torch.fft.irfft(out_ft, n=L, dim=1)
         return self.decoder(x[:, -1, :])
 
-# ================= LOAD MODELS & ASSETS =================
+
+# ================= 2. LOAD MODELS & ASSETS =================
 
 models_data = {}
 model_classes = {
     "dlinear": DLinear,
-    "bilstm": BiLSTM,
-    "informer": Informer,
-    "fedformer": FEDformer
+    "bilstm": BiLSTMForecaster,
+    "informer": InformerForecaster,
+    "fedformer": FEDformerForecaster
 }
 
 @app.on_event("startup")
 def load_assets():
     for name, m_class in model_classes.items():
         try:
+            # Dynamically look for model.pth and _scaler.pkl universally for ALL models
             pth = f"{name}_model.pth"
-            pkl = f"scaler.pkl" # Assuming all models use the same scaler.pkl
+            pkl = f"{name}_scaler.pkl"
 
             if os.path.exists(pth) and os.path.exists(pkl):
                 model = m_class()
                 
-                # 🔥 STRICT=TRUE ensures architectures match perfectly
-                is_strict = True if name == "dlinear" else False 
-                model.load_state_dict(torch.load(pth, map_location="cpu"), strict=is_strict)
+                # strict=True ensures architectures match perfectly so you don't get wild predictions
+                model.load_state_dict(torch.load(pth, map_location="cpu"), strict=True)
                 model.eval()
 
                 with open(pkl, "rb") as f:
@@ -130,7 +140,7 @@ def load_assets():
         except Exception as e:
             print(f"❌ Error loading {name}: {e}")
 
-# ================= INPUT SCHEMA =================
+# ================= 3. INPUT SCHEMA =================
 
 class PredictRequest(BaseModel):
     temp: float
@@ -140,20 +150,15 @@ class PredictRequest(BaseModel):
     hour: int
     model_name: str
 
-# ================= HISTORY GENERATION =================
+# ================= 4. HISTORY GENERATION =================
 
 def generate_history_sequence(data):
-    """
-    NOTE: In a production environment, this should ideally be replaced 
-    by fetching the actual last 24 hours of real data from a database.
-    """
     base = data.prev_load
     hour = data.hour
     seq = []
 
     for i in range(24):
         h = (hour - 23 + i) % 24
-
         if 0 <= h < 5:      factor = 0.55
         elif 5 <= h < 9:    factor = 0.75
         elif 9 <= h < 17:   factor = 0.90
@@ -161,19 +166,11 @@ def generate_history_sequence(data):
         else:               factor = 0.80
 
         hist_load = base * factor
-
-        seq.append([
-            data.temp,
-            hist_load,
-            data.isHoliday,
-            data.month,
-            h,
-            hist_load
-        ])
+        seq.append([data.temp, hist_load, data.isHoliday, data.month, h, hist_load])
 
     return np.array(seq)
 
-# ================= INFERENCE LOGIC =================
+# ================= 5. INFERENCE LOGIC =================
 
 def run_inference(data: PredictRequest):
     key = data.model_name.lower()
@@ -196,22 +193,23 @@ def run_inference(data: PredictRequest):
     with torch.no_grad():
         outputs = model(input_tensor)
         
-        # 🔥 EXTRACT CORRECT VALUE: 
-        # DLinear returns [batch_size, pred_len, features] -> [1, 1, 6]
-        # We need the 1st batch, 1st prediction, last feature (-1)
-        pred_scaled = outputs[0, 0, -1].cpu().item()
+        # 🔥 THE CRITICAL FIX: DLinear returns a 3D matrix [1, 1, 6], 
+        # while BiLSTM/Informer/FEDformer return a 2D matrix [1, 1]
+        if key == "dlinear":
+            pred_scaled = outputs[0, 0, -1].cpu().item()
+        else:
+            pred_scaled = outputs[0, 0].cpu().item()
 
     # 5. Inverse Scale
     dummy = np.zeros((1, 6))
-    dummy[0, :5] = scaled_seq[-1, :5] # Fill with last known features
-    dummy[0, 5] = pred_scaled         # Put prediction in the target column
+    dummy[0, :5] = scaled_seq[-1, :5] 
+    dummy[0, 5] = pred_scaled         
 
     final = scaler.inverse_transform(dummy)[0, 5]
     
-    # Return clipped and rounded result
     return round(float(np.clip(final, 0, 650)), 2)
 
-# ================= ROUTES =================
+# ================= 6. ROUTES =================
 
 @app.post("/predict")
 async def predict(data: PredictRequest):
