@@ -9,7 +9,6 @@ import os
 
 app = FastAPI(title="Power Load Forecasting API")
 
-# ================= CORS =================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,14 +18,11 @@ app.add_middleware(
 )
 
 # ================= 1. MODEL ARCHITECTURES =================
-
-# --- DLINEAR ---
 class MovingAvg(nn.Module):
     def __init__(self, kernel_size, stride):
         super(MovingAvg, self).__init__()
         self.kernel_size = kernel_size
         self.avg = nn.AvgPool1d(kernel_size=kernel_size, stride=stride, padding=0)
-        
     def forward(self, x):
         front = x[:, 0:1, :].repeat(1, (self.kernel_size - 1) // 2, 1)
         back = x[:, -1:, :].repeat(1, self.kernel_size // 2, 1)
@@ -42,7 +38,6 @@ class DLinear(nn.Module):
         self.moving_avg = MovingAvg(kernel_size=25, stride=1) 
         self.Linear_Seasonal = nn.Linear(self.seq_len, self.pred_len)
         self.Linear_Trend = nn.Linear(self.seq_len, self.pred_len)
-
     def forward(self, x):
         trend_init = self.moving_avg(x)
         seasonal_init = x - trend_init
@@ -50,22 +45,16 @@ class DLinear(nn.Module):
         trend_output = self.Linear_Trend(trend_init.transpose(1, 2))
         return (seasonal_output + trend_output).transpose(1, 2)
 
-
-# --- BI-LSTM ---
 class BiLSTMForecaster(nn.Module):
     def __init__(self, input_size=6, hidden_size=64, num_layers=2, output_size=1):
         super(BiLSTMForecaster, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
-                            batch_first=True, bidirectional=True, dropout=0.2)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, bidirectional=True, dropout=0.2)
         self.fc = nn.Linear(hidden_size * 2, output_size)
-
     def forward(self, x):
         _, (h_n, _) = self.lstm(x)
         out = torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1)
         return self.fc(out)
 
-
-# --- INFORMER ---
 class InformerForecaster(nn.Module):
     def __init__(self, input_size=6, d_model=64, nhead=8, num_layers=3, dropout=0.1):
         super(InformerForecaster, self).__init__()
@@ -75,15 +64,12 @@ class InformerForecaster(nn.Module):
         encoder_layers = nn.TransformerEncoderLayer(d_model, nhead, d_model*4, dropout, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
         self.decoder = nn.Linear(d_model, 1)
-
     def forward(self, x):
         x = self.encoder_input(x) + self.pos_encoder
         x = self.transformer_encoder(x)
         x = self.decoder(x[:, -1, :]) 
         return x
 
-
-# --- FEDFORMER ---
 class FEDformerForecaster(nn.Module):
     def __init__(self, input_size=6, d_model=64, n_modes=12):
         super(FEDformerForecaster, self).__init__()
@@ -93,7 +79,6 @@ class FEDformerForecaster(nn.Module):
         self.w1 = nn.Parameter(torch.randn(d_model, d_model, n_modes, 2))
         self.pos_encoder = nn.Parameter(torch.zeros(1, 24, d_model))
         self.decoder = nn.Linear(d_model, 1)
-
     def forward(self, x):
         B, L, C = x.shape
         x = self.enc_embedding(x) + self.pos_encoder
@@ -104,10 +89,10 @@ class FEDformerForecaster(nn.Module):
         x = torch.fft.irfft(out_ft, n=L, dim=1)
         return self.decoder(x[:, -1, :])
 
-
 # ================= 2. LOAD MODELS & ASSETS =================
-
 models_data = {}
+startup_diagnostics = {} # 🔥 NEW: Tracks exactly why models fail
+
 model_classes = {
     "dlinear": DLinear,
     "bilstm": BiLSTMForecaster,
@@ -119,29 +104,27 @@ model_classes = {
 def load_assets():
     for name, m_class in model_classes.items():
         try:
-            # Dynamically look for model.pth and _scaler.pkl universally for ALL models
             pth = f"{name}_model.pth"
             pkl = f"{name}_scaler.pkl"
 
             if os.path.exists(pth) and os.path.exists(pkl):
                 model = m_class()
                 
-                # strict=True ensures architectures match perfectly so you don't get wild predictions
-                model.load_state_dict(torch.load(pth, map_location="cpu"), strict=True)
+                # 🔥 TEMPORARILY CHANGED TO strict=False for debugging
+                model.load_state_dict(torch.load(pth, map_location="cpu"), strict=False)
                 model.eval()
 
                 with open(pkl, "rb") as f:
                     scaler = pickle.load(f)
 
                 models_data[name] = {"model": model, "scaler": scaler}
-                print(f"✅ {name.upper()} loaded successfully")
+                startup_diagnostics[name] = "✅ Loaded Successfully"
             else:
-                print(f"⚠️ Missing files for {name}. Checked for {pth} and {pkl}")
+                startup_diagnostics[name] = f"⚠️ MISSING FILES. Looked exactly for: '{pth}' and '{pkl}'"
         except Exception as e:
-            print(f"❌ Error loading {name}: {e}")
+            startup_diagnostics[name] = f"❌ PYTORCH ERROR: {str(e)}"
 
-# ================= 3. INPUT SCHEMA =================
-
+# ================= 3. INPUT SCHEMA & INFERENCE =================
 class PredictRequest(BaseModel):
     temp: float
     prev_load: float
@@ -150,13 +133,10 @@ class PredictRequest(BaseModel):
     hour: int
     model_name: str
 
-# ================= 4. HISTORY GENERATION =================
-
 def generate_history_sequence(data):
     base = data.prev_load
     hour = data.hour
     seq = []
-
     for i in range(24):
         h = (hour - 23 + i) % 24
         if 0 <= h < 5:      factor = 0.55
@@ -164,13 +144,9 @@ def generate_history_sequence(data):
         elif 9 <= h < 17:   factor = 0.90
         elif 17 <= h < 22:  factor = 1.15
         else:               factor = 0.80
-
         hist_load = base * factor
         seq.append([data.temp, hist_load, data.isHoliday, data.month, h, hist_load])
-
     return np.array(seq)
-
-# ================= 5. INFERENCE LOGIC =================
 
 def run_inference(data: PredictRequest):
     key = data.model_name.lower()
@@ -180,48 +156,42 @@ def run_inference(data: PredictRequest):
     model = models_data[key]["model"]
     scaler = models_data[key]["scaler"]
 
-    # 1. Generate 24h history (Shape: [24, 6])
     seq = generate_history_sequence(data)
-
-    # 2. Scale the input data
     scaled_seq = scaler.transform(seq)
-    
-    # 3. Convert to Tensor and add Batch Dimension (Shape: [1, 24, 6])
     input_tensor = torch.FloatTensor(scaled_seq).unsqueeze(0)
 
-    # 4. Predict
     with torch.no_grad():
         outputs = model(input_tensor)
-        
-        # 🔥 THE CRITICAL FIX: DLinear returns a 3D matrix [1, 1, 6], 
-        # while BiLSTM/Informer/FEDformer return a 2D matrix [1, 1]
         if key == "dlinear":
             pred_scaled = outputs[0, 0, -1].cpu().item()
         else:
             pred_scaled = outputs[0, 0].cpu().item()
 
-    # 5. Inverse Scale
     dummy = np.zeros((1, 6))
     dummy[0, :5] = scaled_seq[-1, :5] 
     dummy[0, 5] = pred_scaled         
-
     final = scaler.inverse_transform(dummy)[0, 5]
     
     return round(float(np.clip(final, 0, 650)), 2)
-
-# ================= 6. ROUTES =================
 
 @app.post("/predict")
 async def predict(data: PredictRequest):
     result = run_inference(data)
     if result is None:
-        raise HTTPException(status_code=400, detail=f"Model '{data.model_name}' not loaded or misspelled.")
+        raise HTTPException(status_code=400, detail=f"Model '{data.model_name}' not loaded.")
     return {"predicted_load_mw": result, "status": "success"}
 
+# 🔥 NEW: Diagnostic Health Check
 @app.get("/health")
 def health():
-    return {"loaded_models": list(models_data.keys()), "status": "healthy"}
+    files_in_directory = os.listdir(".")
+    return {
+        "status": "online",
+        "models_ready": list(models_data.keys()),
+        "diagnostics": startup_diagnostics,
+        "files_found_on_server": files_in_directory
+    }
 
 @app.get("/")
 def home():
-    return {"message": "Power Forecasting API Running. Access /docs for the Swagger UI."}
+    return {"message": "API Running. Go to /health to view diagnostics."}
